@@ -147,22 +147,59 @@ class VersatileConvSE3(nn.Module):
         with nvtx_range(f'VersatileConvSE3'):
             num_edges = features.shape[0]
             in_dim = features.shape[2]
-            with nvtx_range(f'RadialProfile'):
-                radial_weights = self.radial_func(invariant_edge_feats) \
-                    .view(-1, self.channels_out, self.channels_in * self.freq_sum)
+            if (self.training or num_edges<=4096):
+                with nvtx_range(f'RadialProfile'):
+                    radial_weights = self.radial_func(invariant_edge_feats) \
+                        .view(-1, self.channels_out, self.channels_in * self.freq_sum)
 
-            if basis is not None:
-                # This block performs the einsum n i l, n o i f, n l f k -> n o k
-                out_dim = basis.shape[-1]
-                if self.fuse_level != ConvSE3FuseLevel.FULL:
-                    out_dim += out_dim % 2 - 1  # Account for padded basis
-                basis_view = basis.view(num_edges, in_dim, -1)
-                tmp = (features @ basis_view).view(num_edges, -1, basis.shape[-1])
-                return (radial_weights @ tmp)[:, :, :out_dim]
+                if basis is not None:
+                    # This block performs the einsum n i l, n o i f, n l f k -> n o k
+                    out_dim = basis.shape[-1]
+                    if self.fuse_level != ConvSE3FuseLevel.FULL:
+                        out_dim += out_dim % 2 - 1  # Account for padded basis
+                    basis_view = basis.view(num_edges, in_dim, -1)
+                    tmp = (features @ basis_view).view(num_edges, -1, basis.shape[-1])
+                    retval = (radial_weights @ tmp)[:, :, :out_dim]
+                    return retval
+                else:
+                    # k = l = 0 non-fused case
+                    retval = radial_weights @ features
+                    
             else:
-                # k = l = 0 non-fused case
-                return radial_weights @ features
+                #fd reduce memory in inference
+                EDGESTRIDE = 65536 #16384
+                if basis is not None:
+                    out_dim = basis.shape[-1]
+                    if self.fuse_level != ConvSE3FuseLevel.FULL:
+                        out_dim += out_dim % 2 - 1  # Account for padded basis
+                else:
+                    out_dim = features.shape[-1]
 
+                retval = torch.zeros(
+                    (num_edges, self.channels_out, out_dim), 
+                    dtype=features.dtype, 
+                    device=features.device
+                )
+
+                for i in range((num_edges-1)//EDGESTRIDE+1):
+                    e_i,e_j = i*EDGESTRIDE, min((i+1)*EDGESTRIDE,num_edges)
+
+                    radial_weights = self.radial_func(invariant_edge_feats[e_i:e_j]) \
+                        .view(-1, self.channels_out, self.channels_in * self.freq_sum)
+
+                    if basis is not None:
+                        # This block performs the einsum n i l, n o i f, n l f k -> n o k
+                        basis_view = basis[e_i:e_j].view(e_j-e_i, in_dim, -1)
+                        with torch.cuda.amp.autocast(False):
+                            tmp = (features[e_i:e_j] @ basis_view.float()).view(e_j-e_i, -1, basis.shape[-1])
+                            retslice = (radial_weights.float() @ tmp)[:, :, :out_dim]
+                            retval[e_i:e_j] = retslice
+
+                    else:
+                        # k = l = 0 non-fused case
+                        retval[e_i:e_j] = radial_weights @ features[e_i:e_j]
+
+                return retval
 
 class ConvSE3(nn.Module):
     """
@@ -187,6 +224,7 @@ class ConvSE3(nn.Module):
             pool: bool = True,
             use_layer_norm: bool = False,
             self_interaction: bool = False,
+            sum_over_edge: bool = True,
             max_degree: int = 4,
             fuse_level: ConvSE3FuseLevel = ConvSE3FuseLevel.FULL,
             allow_fused_output: bool = False
@@ -207,6 +245,7 @@ class ConvSE3(nn.Module):
         self.fiber_in = fiber_in
         self.fiber_out = fiber_out
         self.self_interaction = self_interaction
+        self.sum_over_edge = sum_over_edge
         self.max_degree = max_degree
         self.allow_fused_output = allow_fused_output
 
@@ -251,7 +290,6 @@ class ConvSE3(nn.Module):
                 sum_freq = sum([degree_to_dim(min(d_in, d)) for d in fiber_out.degrees])
                 self.conv_in[str(d_in)] = VersatileConvSE3(sum_freq, c_in, list(channels_out_set)[0],
                                                            fuse_level=ConvSE3FuseLevel.FULL, **common_args)
-                                                           #fuse_level=self.used_fuse_level, **common_args)
         else:
             # Use pairwise TFN convolutions
             self.used_fuse_level = ConvSE3FuseLevel.NONE
@@ -329,9 +367,16 @@ class ConvSE3(nn.Module):
                         out[str(degree_out)] += kernel_self @ dst_features
 
                 if self.pool:
-                    with nvtx_range(f'pooling'):
-                        if isinstance(out, dict):
-                            out[str(degree_out)] = dgl.ops.copy_e_sum(graph, out[str(degree_out)])
-                        else:
-                            out = dgl.ops.copy_e_sum(graph, out)
+                    if self.sum_over_edge:
+                        with nvtx_range(f'pooling'):
+                            if isinstance(out, dict):
+                                out[str(degree_out)] = dgl.ops.copy_e_sum(graph, out[str(degree_out)])
+                            else:
+                                out = dgl.ops.copy_e_sum(graph, out)
+                    else:
+                        with nvtx_range(f'pooling'):
+                            if isinstance(out, dict):
+                                out[str(degree_out)] = dgl.ops.copy_e_mean(graph, out[str(degree_out)])
+                            else:
+                                out = dgl.ops.copy_e_mean(graph, out)
             return out

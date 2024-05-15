@@ -79,10 +79,11 @@ class AttentionSE3(nn.Module):
 
             with nvtx_range('attention dot product + softmax'):
                 # Compute attention weights (softmax of inner product between key and query)
-                edge_weights = dgl.ops.e_dot_v(graph, key, query).squeeze(-1)
-                edge_weights /= np.sqrt(self.key_fiber.num_features)
-                edge_weights = edge_softmax(graph, edge_weights)
-                edge_weights = edge_weights[..., None, None]
+                with torch.cuda.amp.autocast(False):
+                    edge_weights = dgl.ops.e_dot_v(graph, key, query).squeeze(-1)
+                    edge_weights /= np.sqrt(self.key_fiber.num_features)
+                    edge_weights = edge_softmax(graph, edge_weights)
+                    edge_weights = edge_weights[..., None, None]
 
             with nvtx_range('weighted sum'):
                 if isinstance(value, Tensor):
@@ -113,7 +114,7 @@ class AttentionBlockSE3(nn.Module):
             fiber_out: Fiber,
             fiber_edge: Optional[Fiber] = None,
             num_heads: int = 4,
-            channels_div: int = 2,
+            channels_div: Optional[Dict[str,int]] = None,
             use_layer_norm: bool = False,
             max_degree: bool = 4,
             fuse_level: ConvSE3FuseLevel = ConvSE3FuseLevel.FULL,
@@ -134,7 +135,11 @@ class AttentionBlockSE3(nn.Module):
             fiber_edge = Fiber({})
         self.fiber_in = fiber_in
         # value_fiber has same structure as fiber_out but #channels divided by 'channels_div'
-        value_fiber = Fiber([(degree, channels // channels_div) for degree, channels in fiber_out])
+        if channels_div is not None:
+            value_fiber = Fiber([(degree, channels // channels_div[str(degree)]) for degree, channels in fiber_out])
+        else:
+            value_fiber = Fiber([(degree, channels) for degree, channels in fiber_out])
+
         # key_query_fiber has the same structure as fiber_out, but only degrees which are in in_fiber
         # (queries are merely projected, hence degrees have to match input)
         key_query_fiber = Fiber([(fe.degree, fe.channels) for fe in value_fiber if fe.degree in fiber_in.degrees])
@@ -159,8 +164,9 @@ class AttentionBlockSE3(nn.Module):
                 key, value = self._get_key_value_from_fused(fused_key_value)
 
             with nvtx_range('queries'):
-                query = self.to_query(node_features)
-            
+                with torch.cuda.amp.autocast(False):
+                    query = self.to_query(node_features)
+
             z = self.attention(value, key, query, graph)
             z_concat = aggregate_residual(node_features, z, 'cat')
             return self.project(z_concat)

@@ -32,6 +32,7 @@ from torch import Tensor
 from se3_transformer.model.basis import get_basis, update_basis_with_fused
 from se3_transformer.model.layers.attention import AttentionBlockSE3
 from se3_transformer.model.layers.convolution import ConvSE3, ConvSE3FuseLevel
+from se3_transformer.model.layers.linear import LinearSE3
 from se3_transformer.model.layers.norm import NormSE3
 from se3_transformer.model.layers.pooling import GPooling
 from se3_transformer.runtime.utils import str2bool
@@ -70,10 +71,13 @@ class SE3Transformer(nn.Module):
                  fiber_edge: Fiber = Fiber({}),
                  return_type: Optional[int] = None,
                  pooling: Optional[Literal['avg', 'max']] = None,
+                 final_layer: Optional[Literal['conv', 'lin', 'att']] = 'conv',
                  norm: bool = True,
                  use_layer_norm: bool = True,
                  tensor_cores: bool = False,
                  low_memory: bool = False,
+                 populate_edge: Optional[Literal['lin', 'arcsin', 'log', 'zero']] = 'lin',
+                 sum_over_edge: bool = True,
                  **kwargs):
         """
         :param num_layers:          Number of attention layers
@@ -100,12 +104,17 @@ class SE3Transformer(nn.Module):
         self.max_degree = max(*fiber_in.degrees, *fiber_hidden.degrees, *fiber_out.degrees)
         self.tensor_cores = tensor_cores
         self.low_memory = low_memory
+        self.populate_edge = populate_edge
 
         if low_memory and not tensor_cores:
             logging.warning('Low memory mode will have no effect with no Tensor Cores')
 
         # Fully fused convolutions when using Tensor Cores (and not low memory mode)
         fuse_level = ConvSE3FuseLevel.FULL if tensor_cores and not low_memory else ConvSE3FuseLevel.PARTIAL
+        
+        div = dict((str(degree), channels_div) for degree in range(self.max_degree+1))
+        div_fin = dict((str(degree), 1) for degree in range(self.max_degree+1))
+        div_fin['0'] = channels_div
 
         graph_modules = []
         for i in range(num_layers):
@@ -113,7 +122,7 @@ class SE3Transformer(nn.Module):
                                                    fiber_out=fiber_hidden,
                                                    fiber_edge=fiber_edge,
                                                    num_heads=num_heads,
-                                                   channels_div=channels_div,
+                                                   channels_div=div,
                                                    use_layer_norm=use_layer_norm,
                                                    max_degree=self.max_degree,
                                                    fuse_level=fuse_level))
@@ -121,12 +130,26 @@ class SE3Transformer(nn.Module):
                 graph_modules.append(NormSE3(fiber_hidden))
             fiber_in = fiber_hidden
 
-        graph_modules.append(ConvSE3(fiber_in=fiber_in,
-                                     fiber_out=fiber_out,
-                                     fiber_edge=fiber_edge,
-                                     self_interaction=True,
-                                     use_layer_norm=use_layer_norm,
-                                     max_degree=self.max_degree))
+        if final_layer == 'conv':
+            graph_modules.append(ConvSE3(fiber_in=fiber_in,
+                                         fiber_out=fiber_out,
+                                         fiber_edge=fiber_edge,
+                                         self_interaction=True,
+                                         sum_over_edge=sum_over_edge,
+                                         use_layer_norm=use_layer_norm,
+                                         max_degree=self.max_degree))
+        elif final_layer == "lin":
+            graph_modules.append(LinearSE3(fiber_in=fiber_in,
+                                           fiber_out=fiber_out))
+        else:
+            graph_modules.append(AttentionBlockSE3(fiber_in=fiber_in,
+                                                   fiber_out=fiber_out,
+                                                   fiber_edge=fiber_edge,
+                                                   num_heads=1,
+                                                   channels_div=div_fin,
+                                                   use_layer_norm=use_layer_norm,
+                                                   max_degree=self.max_degree,
+                                                   fuse_level=fuse_level))
         self.graph_modules = Sequential(*graph_modules)
 
         if pooling is not None:
@@ -144,8 +167,20 @@ class SE3Transformer(nn.Module):
         # Add fused bases (per output degree, per input degree, and fully fused) to the dict
         basis = update_basis_with_fused(basis, self.max_degree, use_pad_trick=self.tensor_cores and not self.low_memory,
                                         fully_fused=self.tensor_cores and not self.low_memory)
-
-        edge_feats = get_populated_edge_features(graph.edata['rel_pos'], edge_feats)
+        
+        if self.populate_edge=='lin':
+            edge_feats = get_populated_edge_features(graph.edata['rel_pos'], edge_feats)
+        elif self.populate_edge=='arcsin':
+            r = graph.edata['rel_pos'].norm(dim=-1, keepdim=True)
+            r = torch.maximum(r, torch.zeros_like(r) + 4.0) - 4.0
+            r = torch.arcsinh(r)/3.0
+            edge_feats['0'] = torch.cat([edge_feats['0'], r[..., None]], dim=1)
+        elif self.populate_edge=='log':
+            # fd - replace with log(1+x)
+            r = torch.log( 1 + graph.edata['rel_pos'].norm(dim=-1, keepdim=True) )
+            edge_feats['0'] = torch.cat([edge_feats['0'], r[..., None]], dim=1)
+        else:
+            edge_feats['0'] = torch.cat((edge_feats['0'], torch.zeros_like(edge_feats['0'][:,:1,:])), dim=1)
 
         node_feats = self.graph_modules(node_feats, edge_feats, graph=graph, basis=basis)
 
