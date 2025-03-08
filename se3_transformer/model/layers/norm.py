@@ -27,8 +27,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 from torch import Tensor
-#from torch.cuda.nvtx import range as nvtx_range
-from se3_transformer.runtime.utils import nvtx_range as nvtx_range
+from torch.cuda.nvtx import range as nvtx_range
 
 from se3_transformer.model.fiber import Fiber
 
