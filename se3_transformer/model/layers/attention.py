@@ -79,27 +79,28 @@ class AttentionSE3(nn.Module):
 
             with nvtx_range('attention dot product + softmax'):
                 # Compute attention weights (softmax of inner product between key and query)
-                edge_weights = dgl.ops.e_dot_v(graph, key, query).squeeze(-1)
+                edge_weights = dgl.ops.e_dot_v(graph, key.to('cpu'), query.to('cpu')).squeeze(-1)
                 edge_weights /= np.sqrt(self.key_fiber.num_features)
                 edge_weights = edge_softmax(graph, edge_weights)
                 edge_weights = edge_weights[..., None, None]
+            
 
             with nvtx_range('weighted sum'):
                 if isinstance(value, Tensor):
                     # features of all types are fused
                     v = value.view(value.shape[0], self.num_heads, -1, value.shape[-1])
-                    weights = edge_weights * v
+                    weights = edge_weights * v.to('cpu')
                     feat_out = dgl.ops.copy_e_sum(graph, weights)
                     feat_out = feat_out.view(feat_out.shape[0], -1, feat_out.shape[-1])  # merge heads
-                    out = unfuse_features(feat_out, self.value_fiber.degrees)
+                    out = {k:v.to('mps') for k, v in unfuse_features(feat_out, self.value_fiber.degrees).items()}
                 else:
                     out = {}
                     for degree, channels in self.value_fiber:
                         v = value[str(degree)].view(-1, self.num_heads, channels // self.num_heads,
                                                     degree_to_dim(degree))
-                        weights = edge_weights * v
+                        weights = edge_weights* v.to('cpu')
                         res = dgl.ops.copy_e_sum(graph, weights)
-                        out[str(degree)] = res.view(-1, channels, degree_to_dim(degree))  # merge heads
+                        out[str(degree)] = res.view(-1, channels, degree_to_dim(degree)).to('mps')  # merge heads
 
                 return out
 

@@ -52,7 +52,7 @@ def get_populated_edge_features(relative_pos: Tensor, edge_features: Optional[Di
     edge_features = edge_features.copy() if edge_features else {}
     r = relative_pos.norm(dim=-1, keepdim=True)
     if '0' in edge_features:
-        edge_features['0'] = torch.cat([edge_features['0'], r[..., None]], dim=1)
+        edge_features['0'] = torch.cat([edge_features['0'].to('mps'), r[..., None].to('mps')], dim=1)
     else:
         edge_features['0'] = r[..., None]
 

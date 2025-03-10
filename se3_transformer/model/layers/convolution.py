@@ -157,7 +157,7 @@ class VersatileConvSE3(nn.Module):
                 if self.fuse_level != ConvSE3FuseLevel.FULL:
                     out_dim += out_dim % 2 - 1  # Account for padded basis
                 basis_view = basis.view(num_edges, in_dim, -1)
-                tmp = (features @ basis_view).view(num_edges, -1, basis.shape[-1])
+                tmp = (features.to('cpu') @ basis_view.to('cpu')).view(num_edges, -1, basis.shape[-1]).to('mps')
                 return (radial_weights @ tmp)[:, :, :out_dim]
             else:
                 # k = l = 0 non-fused case
@@ -331,7 +331,7 @@ class ConvSE3(nn.Module):
                 if self.pool:
                     with nvtx_range(f'pooling'):
                         if isinstance(out, dict):
-                            out[str(degree_out)] = dgl.ops.copy_e_sum(graph, out[str(degree_out)])
+                            out[str(degree_out)] = dgl.ops.copy_e_sum(graph, out[str(degree_out)].to('cpu'))
                         else:
                             out = dgl.ops.copy_e_sum(graph, out)
             return out
