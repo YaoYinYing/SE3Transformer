@@ -334,4 +334,6 @@ class ConvSE3(nn.Module):
                             out[str(degree_out)] = dgl.ops.copy_e_sum(graph, out[str(degree_out)].to('cpu'))
                         else:
                             out = dgl.ops.copy_e_sum(graph, out)
+
+            torch.mps.empty_cache()
             return out

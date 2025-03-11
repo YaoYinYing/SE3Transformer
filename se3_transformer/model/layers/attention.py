@@ -101,7 +101,7 @@ class AttentionSE3(nn.Module):
                         weights = edge_weights* v.to('cpu')
                         res = dgl.ops.copy_e_sum(graph, weights)
                         out[str(degree)] = res.view(-1, channels, degree_to_dim(degree)).to('mps')  # merge heads
-
+                torch.mps.empty_cache()
                 return out
 
 
