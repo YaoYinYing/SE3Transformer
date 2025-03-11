@@ -56,6 +56,7 @@ def get_populated_edge_features(relative_pos: Tensor, edge_features: Optional[Di
     else:
         edge_features['0'] = r[..., None]
 
+    torch.mps.empty_cache()
     return edge_features
 
 
